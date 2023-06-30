@@ -46,7 +46,7 @@ ARG wikipedia_alt='farside.link/wikiless'
 ARG imdb_alt='farside.link/libremdb'
 ARG quora_alt='farside.link/quetre'
 
-ENV CONFIG_VOLUME=/config \
+ENV CONFIG_VOLUME=$config_dir \
     WHOOGLE_URL_PREFIX=$url_prefix \
     WHOOGLE_USER=$username \
     WHOOGLE_PASS=$password \
