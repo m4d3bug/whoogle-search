@@ -24,7 +24,7 @@ ARG DOCKER_USERID=927
 ARG config_dir=/config
 RUN mkdir -p $config_dir
 RUN chmod a+w $config_dir
-VOLUME /config
+#VOLUME /config
 
 ARG url_prefix=''
 ARG username=''
