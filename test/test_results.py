@@ -2,6 +2,7 @@ from bs4 import BeautifulSoup
 from app.filter import Filter
 from app.models.config import Config
 from app.models.endpoint import Endpoint
+from app.utils import results
 from app.utils.session import generate_key
 from datetime import datetime
 from dateutil.parser import ParserError, parse
@@ -44,17 +45,11 @@ def test_get_results(client):
 
 def test_post_results(client):
     rv = client.post(f'/{Endpoint.search}', data=dict(q='test'))
-    assert rv._status_code == 200
-
-    # Depending on the search, there can be more
-    # than 10 result divs
-    results = get_search_results(rv.data)
-    assert len(results) >= 10
-    assert len(results) <= 15
+    assert rv._status_code == 302
 
 
 def test_translate_search(client):
-    rv = client.post(f'/{Endpoint.search}', data=dict(q='translate hola'))
+    rv = client.get(f'/{Endpoint.search}?q=translate hola')
     assert rv._status_code == 200
 
     # Pretty weak test, but better than nothing
@@ -64,7 +59,7 @@ def test_translate_search(client):
 
 
 def test_block_results(client):
-    rv = client.post(f'/{Endpoint.search}', data=dict(q='pinterest'))
+    rv = client.get(f'/{Endpoint.search}?q=pinterest')
     assert rv._status_code == 200
 
     has_pinterest = False
@@ -79,7 +74,7 @@ def test_block_results(client):
     rv = client.post(f'/{Endpoint.config}', data=demo_config)
     assert rv._status_code == 302
 
-    rv = client.post(f'/{Endpoint.search}', data=dict(q='pinterest'))
+    rv = client.get(f'/{Endpoint.search}?q=pinterest')
     assert rv._status_code == 200
 
     for link in BeautifulSoup(rv.data, 'html.parser').find_all('a', href=True):
@@ -90,7 +85,7 @@ def test_block_results(client):
 
 
 def test_view_my_ip(client):
-    rv = client.post(f'/{Endpoint.search}', data=dict(q='my ip address'))
+    rv = client.get(f'/{Endpoint.search}?q=my ip address')
     assert rv._status_code == 200
 
     # Pretty weak test, but better than nothing
@@ -101,13 +96,13 @@ def test_view_my_ip(client):
 
 def test_recent_results(client):
     times = {
-        'past year': 365,
-        'past month': 31,
-        'past week': 7
+        'tbs=qdr:y': 365,
+        'tbs=qdr:m': 31,
+        'tbs=qdr:w': 7
     }
 
     for time, num_days in times.items():
-        rv = client.post(f'/{Endpoint.search}', data=dict(q='test :' + time))
+        rv = client.get(f'/{Endpoint.search}?q=test&' + time)
         result_divs = get_search_results(rv.data)
 
         current_date = datetime.now()
@@ -142,3 +137,22 @@ def test_leading_slash_search(client):
             continue
 
         assert link['href'].startswith(f'{Endpoint.search}')
+
+
+def test_site_alt_prefix_skip():
+    # Ensure prefixes are skipped correctly for site alts
+
+    # default silte_alts (farside.link)
+    assert results.get_site_alt(link = 'https://www.reddit.com') == 'https://farside.link/libreddit'
+    assert results.get_site_alt(link = 'https://www.twitter.com') == 'https://farside.link/nitter'
+    assert results.get_site_alt(link = 'https://www.youtube.com') == 'https://farside.link/invidious'
+
+    test_site_alts = {
+    'reddit.com': 'reddit.endswithmobile.domain',
+    'twitter.com': 'https://twitter.endswithm.domain',
+    'youtube.com': 'http://yt.endswithwww.domain',
+    }
+    # Domains with part of SKIP_PREFIX in them
+    assert results.get_site_alt(link = 'https://www.reddit.com', site_alts = test_site_alts) == 'https://reddit.endswithmobile.domain'
+    assert results.get_site_alt(link = 'https://www.twitter.com', site_alts = test_site_alts) == 'https://twitter.endswithm.domain'
+    assert results.get_site_alt(link = 'https://www.youtube.com', site_alts = test_site_alts) == 'http://yt.endswithwww.domain'

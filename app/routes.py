@@ -4,8 +4,12 @@ import io
 import json
 import os
 import pickle
+import re
 import urllib.parse as urlparse
 import uuid
+import validators
+import sys
+import traceback
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -14,11 +18,12 @@ from app import app
 from app.models.config import Config
 from app.models.endpoint import Endpoint
 from app.request import Request, TorError
-from app.utils.bangs import resolve_bang
-from app.utils.misc import get_proxy_host_url
+from app.utils.bangs import suggest_bang, resolve_bang
+from app.utils.misc import empty_gif, placeholder_img, get_proxy_host_url, \
+    fetch_favicon
 from app.filter import Filter
 from app.utils.misc import read_config_bool, get_client_ip, get_request_url, \
-    check_for_update
+    check_for_update, encrypt_string
 from app.utils.widgets import *
 from app.utils.results import bold_search_terms,\
     add_currency_card, check_currency, get_tabs_content
@@ -31,9 +36,7 @@ from requests import exceptions
 from requests.models import PreparedRequest
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.exceptions import InvalidSignature
-
-# Load DDG bang json files only on init
-bang_json = json.load(open(app.config['BANG_FILE'])) or {}
+from werkzeug.datastructures import MultiDict
 
 ac_var = 'WHOOGLE_AUTOCOMPLETE'
 autocomplete_enabled = os.getenv(ac_var, '1')
@@ -126,12 +129,12 @@ def session_required(f):
 
 @app.before_request
 def before_request_func():
-    global bang_json
     session.permanent = True
 
     # Check for latest version if needed
     now = datetime.now()
-    if now - timedelta(hours=24) > app.config['LAST_UPDATE_CHECK']:
+    needs_update_check = now - timedelta(hours=24) > app.config['LAST_UPDATE_CHECK']
+    if read_config_bool('WHOOGLE_UPDATE_CHECK', True) and needs_update_check:
         app.config['LAST_UPDATE_CHECK'] = now
         app.config['HAS_UPDATE'] = check_for_update(
             app.config['RELEASES_URL'],
@@ -167,20 +170,12 @@ def before_request_func():
 
     g.app_location = g.user_config.url
 
-    # Attempt to reload bangs json if not generated yet
-    if not bang_json and os.path.getsize(app.config['BANG_FILE']) > 4:
-        try:
-            bang_json = json.load(open(app.config['BANG_FILE']))
-        except json.decoder.JSONDecodeError:
-            # Ignore decoding error, can occur if file is still
-            # being written
-            pass
-
 
 @app.after_request
 def after_request_func(resp):
     resp.headers['X-Content-Type-Options'] = 'nosniff'
     resp.headers['X-Frame-Options'] = 'DENY'
+    resp.headers['Cache-Control'] = 'max-age=86400'
 
     if os.getenv('WHOOGLE_CSP', False):
         resp.headers['Content-Security-Policy'] = app.config['CSP']
@@ -276,8 +271,7 @@ def autocomplete():
 
     # Search bangs if the query begins with "!", but not "! " (feeling lucky)
     if q.startswith('!') and len(q) > 1 and not q.startswith('! '):
-        return jsonify([q, [bang_json[_]['suggestion'] for _ in bang_json if
-                            _.startswith(q)]])
+        return jsonify([q, suggest_bang(q)])
 
     if not q and not request.data:
         return jsonify({'?': []})
@@ -298,10 +292,17 @@ def autocomplete():
 @session_required
 @auth_required
 def search():
+    if request.method == 'POST':
+        # Redirect as a GET request with an encrypted query
+        post_data = MultiDict(request.form)
+        post_data['q'] = encrypt_string(g.session_key, post_data['q'])
+        get_req_str = urlparse.urlencode(post_data)
+        return redirect(url_for('.search') + '?' + get_req_str)
+
     search_util = Search(request, g.user_config, g.session_key)
     query = search_util.new_search_query()
 
-    bang = resolve_bang(query, bang_json)
+    bang = resolve_bang(query)
     if bang:
         return redirect(bang)
 
@@ -420,13 +421,18 @@ def config():
     config_disabled = (
             app.config['CONFIG_DISABLE'] or
             not valid_user_session(session))
+
+    name = ''
+    if 'name' in request.args:
+        name = os.path.normpath(request.args.get('name'))
+        if not re.match(r'^[A-Za-z0-9_.+-]+$', name):
+            return make_response('Invalid config name', 400)
+
     if request.method == 'GET':
         return json.dumps(g.user_config.__dict__)
     elif request.method == 'PUT' and not config_disabled:
-        if 'name' in request.args:
-            config_pkl = os.path.join(
-                app.config['CONFIG_PATH'],
-                request.args.get('name'))
+        if name:
+            config_pkl = os.path.join(app.config['CONFIG_PATH'], name)
             session['config'] = (pickle.load(open(config_pkl, 'rb'))
                                  if os.path.exists(config_pkl)
                                  else session['config'])
@@ -444,7 +450,7 @@ def config():
                 config_data,
                 open(os.path.join(
                     app.config['CONFIG_PATH'],
-                    request.args.get('name')), 'wb'))
+                    name), 'wb'))
 
         session['config'] = config_data
         return redirect(config_data['url'])
@@ -475,8 +481,23 @@ def element():
 
     src_type = request.args.get('type')
 
+    # Ensure requested element is from a valid domain
+    domain = urlparse.urlparse(src_url).netloc
+    if not validators.domain(domain):
+        return send_file(io.BytesIO(empty_gif), mimetype='image/gif')
+
     try:
-        file_data = g.user_request.send(base_url=src_url).content
+        response = g.user_request.send(base_url=src_url)
+
+        # Display an empty gif if the requested element couldn't be retrieved
+        if response.status_code != 200 or len(response.content) == 0:
+            if 'favicon' in src_url:
+                favicon = fetch_favicon(src_url)
+                return send_file(io.BytesIO(favicon), mimetype='image/png')
+            else:
+                return send_file(io.BytesIO(empty_gif), mimetype='image/gif')
+
+        file_data = response.content
         tmp_mem = io.BytesIO()
         tmp_mem.write(file_data)
         tmp_mem.seek(0)
@@ -485,8 +506,6 @@ def element():
     except exceptions.RequestException:
         pass
 
-    empty_gif = base64.b64decode(
-        'R0lGODlhAQABAIAAAP///////yH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==')
     return send_file(io.BytesIO(empty_gif), mimetype='image/gif')
 
 
@@ -504,6 +523,13 @@ def window():
         root_url=request.url_root,
         config=g.user_config)
     target = urlparse.urlparse(target_url)
+
+    # Ensure requested URL has a valid domain
+    if not validators.domain(target.netloc):
+        return render_template(
+            'error.html',
+            error_message='Invalid location'), 400
+
     host_url = f'{target.scheme}://{target.netloc}'
 
     get_body = g.user_request.send(base_url=target_url).text
@@ -557,7 +583,7 @@ def window():
     )
 
 
-@app.route(f'/robots.txt')
+@app.route('/robots.txt')
 def robots():
     response = make_response(
 '''User-Agent: *
@@ -566,9 +592,43 @@ Disallow: /''', 200)
     return response
 
 
+@app.route('/favicon.ico')
+def favicon():
+    return app.send_static_file('img/favicon.ico')
+
+
 @app.errorhandler(404)
 def page_not_found(e):
     return render_template('error.html', error_message=str(e)), 404
+
+
+@app.errorhandler(Exception)
+def internal_error(e):
+    query = ''
+    if request.method == 'POST':
+        query = request.form.get('q')
+    else:
+        query = request.args.get('q')
+
+    # Attempt to parse the query
+    try:
+        search_util = Search(request, g.user_config, g.session_key)
+        query = search_util.new_search_query()
+    except Exception:
+        pass
+
+    print(traceback.format_exc(), file=sys.stderr)
+
+    localization_lang = g.user_config.get_localization_lang()
+    translation = app.config['TRANSLATIONS'][localization_lang]
+    return render_template(
+            'error.html',
+            error_message='Internal server error (500)',
+            translation=translation,
+            farside='https://farside.link',
+            config=g.user_config,
+            query=urlparse.unquote(query),
+            params=g.user_config.to_params(keys=['preferences'])), 500
 
 
 def run_app() -> None:
@@ -589,6 +649,11 @@ def run_app() -> None:
         default='',
         metavar='</path/to/unix.sock>',
         help='Listen for app on unix socket instead of host:port')
+    parser.add_argument(
+        '--unix-socket-perms',
+        default='600',
+        metavar='<octal permissions>',
+        help='Octal permissions to use for the Unix domain socket (default 600)')
     parser.add_argument(
         '--debug',
         default=False,
@@ -640,7 +705,7 @@ def run_app() -> None:
     if args.debug:
         app.run(host=args.host, port=args.port, debug=args.debug)
     elif args.unix_socket:
-        waitress.serve(app, unix_socket=args.unix_socket)
+        waitress.serve(app, unix_socket=args.unix_socket, unix_socket_perms=args.unix_socket_perms)
     else:
         waitress.serve(
             app,
